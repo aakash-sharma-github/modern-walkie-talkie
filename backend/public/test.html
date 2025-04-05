@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Walkie Talkie Audio Debugger</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+      :root {
+        --primary: #6366f1;
+        --primary-dark: #4f46e5;
+        --success: #22c55e;
+        --danger: #ef4444;
+        --warning: #f59e0b;
+        --dark: #1a1b1e;
+        --light: #f3f4f6;
+        --gray: #71717a;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+          Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+        background-color: var(--dark);
+        color: var(--light);
+        margin: 0;
+        padding: 20px;
+        line-height: 1.6;
+      }
+      h1,
+      h2,
+      h3 {
+        font-weight: 600;
+      }
+      .container {
+        max-width: 800px;
+        margin: 0 auto;
+      }
+      .card {
+        background-color: rgba(255, 255, 255, 0.1);
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 20px;
+      }
+      .section-title {
+        color: var(--primary);
+        margin-top: 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        padding-bottom: 10px;
+      }
+      .status {
+        display: flex;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+      .status-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        margin-right: 10px;
+        background-color: var(--gray);
+      }
+      .status-dot.connected {
+        background-color: var(--success);
+      }
+      .status-dot.disconnected {
+        background-color: var(--danger);
+      }
+      .status-dot.recording {
+        background-color: var(--danger);
+        animation: pulse 1.5s infinite;
+      }
+      .status-dot.playing {
+        background-color: var(--primary);
+        animation: pulse 1.5s infinite;
+      }
+      .button {
+        background-color: var(--primary);
+        color: white;
+        border: none;
+        padding: 10px 15px;
+        border-radius: 5px;
+        cursor: pointer;
+        font-weight: 500;
+        transition: background-color 0.2s;
+      }
+      .button:hover {
+        background-color: var(--primary-dark);
+      }
+      .button:disabled {
+        background-color: var(--gray);
+        cursor: not-allowed;
+      }
+      .button.large {
+        padding: 15px 20px;
+        font-size: 16px;
+      }
+      .button.warning {
+        background-color: var(--warning);
+      }
+      .button.danger {
+        background-color: var(--danger);
+      }
+      .button.success {
+        background-color: var(--success);
+      }
+      .input-group {
+        display: flex;
+        margin-bottom: 15px;
+      }
+      .input-group input {
+        flex: 1;
+        padding: 10px;
+        border: 1px solid var(--gray);
+        border-radius: 5px 0 0 5px;
+        background-color: rgba(255, 255, 255, 0.1);
+        color: white;
+      }
+      .input-group button {
+        border-radius: 0 5px 5px 0;
+      }
+      .audio-display {
+        background-color: rgba(255, 255, 255, 0.05);
+        border-radius: 5px;
+        padding: 15px;
+        margin-top: 10px;
+      }
+      .audio-item {
+        display: flex;
+        align-items: center;
+        padding: 10px;
+        border-radius: 5px;
+        background-color: rgba(255, 255, 255, 0.05);
+        margin-bottom: 10px;
+      }
+      .audio-item:hover {
+        background-color: rgba(255, 255, 255, 0.1);
+      }
+      .audio-controls {
+        margin-left: auto;
+      }
+      .audio-metadata {
+        font-size: 12px;
+        opacity: 0.7;
+        margin-top: 5px;
+      }
+      #log-container {
+        max-height: 300px;
+        overflow-y: auto;
+        background-color: rgba(0, 0, 0, 0.3);
+        padding: 10px;
+        border-radius: 5px;
+        font-family: monospace;
+        margin-top: 10px;
+      }
+      .log-entry {
+        margin-bottom: 5px;
+        word-wrap: break-word;
+      }
+      .log-entry.debug {
+        color: #60a5fa;
+      }
+      .log-entry.info {
+        color: #34d399;
+      }
+      .log-entry.warn {
+        color: #fbbf24;
+      }
+      .log-entry.error {
+        color: #f87171;
+      }
+      .timestamp {
+        color: #9ca3af;
+        margin-right: 8px;
+      }
+      .record-button {
+        height: 100px;
+        width: 100px;
+        border-radius: 50%;
+        background-color: var(--danger);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+        cursor: pointer;
+        user-select: none;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        transition: transform 0.2s, background-color 0.2s;
+        margin: 20px auto;
+      }
+      .record-button:hover {
+        transform: scale(1.05);
+      }
+      .record-button:active {
+        transform: scale(0.95);
+        background-color: #dc2626;
+      }
+      .record-button.recording {
+        animation: pulse 1.5s infinite;
+      }
+      @keyframes pulse {
+        0% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.6;
+        }
+        100% {
+          opacity: 1;
+        }
+      }
+      .visualizer {
+        width: 100%;
+        height: 60px;
+        background-color: rgba(0, 0, 0, 0.3);
+        border-radius: 5px;
+        margin: 10px 0;
+        position: relative;
+        overflow: hidden;
+      }
+      .visualizer-bar {
+        position: absolute;
+        bottom: 0;
+        width: 5px;
+        background-color: var(--primary);
+        border-radius: 5px 5px 0 0;
+      }
+      .small-text {
+        font-size: 12px;
+        opacity: 0.7;
+      }
+      .badge {
+        display: inline-block;
+        background-color: var(--primary);
+        color: white;
+        border-radius: 20px;
+        padding: 3px 8px;
+        font-size: 12px;
+        margin-left: 5px;
+      }
+      .badge.danger {
+        background-color: var(--danger);
+      }
+      .badge.success {
+        background-color: var(--success);
+      }
+      #uploadProgress {
+        width: 100%;
+        height: 6px;
+        background-color: rgba(255, 255, 255, 0.1);
+        border-radius: 3px;
+        margin-top: 10px;
+        overflow: hidden;
+      }
+      #uploadProgressBar {
+        height: 100%;
+        width: 0;
+        background-color: var(--primary);
+        transition: width 0.3s;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Walkie Talkie Audio Debugger</h1>
+
+      <!-- Connection Status -->
+      <div class="card">
+        <h2 class="section-title">Connection Status</h2>
+        <div class="status">
+          <div id="connection-status" class="status-dot"></div>
+          <span id="connection-text">Connecting...</span>
+        </div>
+        <div id="socket-id"></div>
+      </div>
+
+      <!-- Channel Control -->
+      <div class="card">
+        <h2 class="section-title">Channel Control</h2>
+        <div class="input-group">
+          <input
+            type="text"
+            id="channel-input"
+            placeholder="Enter channel (e.g. freq-446.00)"
+            value="freq-446.00"
+          />
+          <button id="join-button" class="button">Join</button>
+        </div>
+        <div id="channel-status">Not in any channel</div>
+        <div id="users-container">
+          <h3>Active Users: <span id="user-count">0</span></h3>
+          <div id="user-list"></div>
+        </div>
+      </div>
+
+      <!-- PTT Control -->
+      <div class="card">
+        <h2 class="section-title">PTT Control</h2>
+        <button id="ptt-on" class="button">PTT ON</button>
+        <button id="ptt-off" class="button">PTT OFF</button>
+        <div id="ptt-status">Current PTT status: OFF</div>
+        <div id="speaking-user">No one is talking</div>
+      </div>
+
+      <!-- Audio Recording -->
+      <div class="card">
+        <h2 class="section-title">Audio Recording</h2>
+        <p>Hold the button to record, release to send.</p>
+        <div class="visualizer" id="recordingVisualizer"></div>
+        <div class="record-button" id="record-button">HOLD TO TALK</div>
+        <div id="recording-status">Ready to record</div>
+        <div id="uploadProgress">
+          <div id="uploadProgressBar"></div>
+        </div>
+        <p class="small-text">
+          Recording Format: 44.1kHz, 16-bit PCM, mono (compressed to AAC)
+        </p>
+      </div>
+
+      <!-- Received Audio -->
+      <div class="card">
+        <h2 class="section-title">Received Audio</h2>
+        <div id="received-audio-container" class="audio-display">
+          No audio received yet
+        </div>
+      </div>
+
+      <!-- Local Audio Testing -->
+      <div class="card">
+        <h2 class="section-title">Local Audio Testing</h2>
+        <div id="local-audio-container" class="audio-display">
+          No local recordings yet
+        </div>
+      </div>
+
+      <!-- Debug Log -->
+      <div class="card">
+        <h2 class="section-title">Debug Log</h2>
+        <button id="clear-log" class="button warning">Clear Log</button>
+        <div id="log-container"></div>
+      </div>
+    </div>
+
+    <script>
+      // Socket.io connection
+      let socket;
+      let currentChannel = null;
+      let mediaRecorder = null;
+      let audioChunks = [];
+      let recordingStartTime = 0;
+      let currentAudioBlob = null;
+      let localAudioUrl = null;
+      let visualizerInterval = null;
+      let audioContext = null;
+      let analyser = null;
+      let source = null;
+
+      // Initialize the app
+      document.addEventListener('DOMContentLoaded', init);
+
+      function init() {
+        // Set up socket connection
+        connectSocket();
+
+        // Set up UI event listeners
+        document
+          .getElementById('join-button')
+          .addEventListener('click', joinChannel);
+        document
+          .getElementById('ptt-on')
+          .addEventListener('click', () => sendPTTStatus(true));
+        document
+          .getElementById('ptt-off')
+          .addEventListener('click', () => sendPTTStatus(false));
+        document
+          .getElementById('clear-log')
+          .addEventListener('click', clearLog);
+
+        // Set up recording button
+        const recordButton = document.getElementById('record-button');
+        recordButton.addEventListener('mousedown', startRecording);
+        recordButton.addEventListener('touchstart', startRecording);
+        recordButton.addEventListener('mouseup', stopRecording);
+        recordButton.addEventListener('touchend', stopRecording);
+        recordButton.addEventListener('mouseleave', stopRecording);
+
+        // Log initial state
+        log('App initialized', 'debug');
+      }
+
+      function connectSocket() {
+        // Connect to socket.io server
+        log('Connecting to server...', 'info');
+
+        // Get server URL from current location
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.hostname;
+        const port = window.location.port;
+        const socketUrl = `${window.location.protocol}//${host}${
+          port ? ':' + port : ''
+        }`;
+
+        log(`Using socket URL: ${socketUrl}`, 'debug');
+        socket = io(socketUrl);
+
+        // Socket event handlers
+        socket.on('connect', () => {
+          updateConnectionStatus(true);
+          log('Connected to server', 'info');
+          document.getElementById(
+            'socket-id'
+          ).innerText = `Your socket ID: ${socket.id}`;
+        });
+
+        socket.on('disconnect', () => {
+          updateConnectionStatus(false);
+          log('Disconnected from server', 'warn');
+        });
+
+        // Listen for active users update
+        socket.on('activeUsers', (users) => {
+          log(`Received active users: ${users.length}`, 'debug');
+          updateUserList(users);
+        });
+
+        // Listen for user joined events
+        socket.on('userJoined', (userId) => {
+          log(`User joined: ${userId}`, 'info');
+          // Instead of updating ourselves, we'll wait for a full activeUsers update
+        });
+
+        // Listen for user left events
+        socket.on('userLeft', (userId) => {
+          log(`User left: ${userId}`, 'info');
+          // Instead of updating ourselves, we'll wait for a full activeUsers update
+        });
+
+        // Listen for PTT status updates
+        socket.on('pttStatus', ({ userId, status }) => {
+          log(`Received PTT status from ${userId}: ${status}`, 'debug');
+          updateSpeakingUser(userId, status);
+        });
+
+        // Listen for audio data
+        socket.on('audioData', async ({ userId, data }) => {
+          log(`Received audio from ${userId}`, 'info');
+          log(`Audio data: ${JSON.stringify(data)}`, 'debug');
+
+          try {
+            if (!data || !data.uri) {
+              throw new Error('Invalid audio data received');
+            }
+
+            // Display the received audio
+            displayReceivedAudio(userId, data.uri);
+
+            // Create an audio element and play it
+            const audio = new Audio(data.uri);
+            audio.onloadedmetadata = () => {
+              log(`Audio duration: ${audio.duration.toFixed(2)}s`, 'debug');
+            };
+            audio.onplay = () => {
+              log(`Playing audio from ${userId}`, 'info');
+            };
+            audio.onended = () => {
+              log(`Finished playing audio from ${userId}`, 'debug');
+            };
+            audio.onerror = (e) => {
+              log(`Error playing audio: ${e.message}`, 'error');
+            };
+
+            // Play the audio
+            try {
+              await audio.play();
+            } catch (playError) {
+              log(`Could not autoplay audio: ${playError.message}`, 'error');
+              log(
+                'Please interact with the page to enable audio playback',
+                'warn'
+              );
+            }
+          } catch (error) {
+            log(`Error processing received audio: ${error.message}`, 'error');
+          }
+        });
+      }
+
+      function updateConnectionStatus(connected) {
+        const statusDot = document.getElementById('connection-status');
+        const statusText = document.getElementById('connection-text');
+
+        if (connected) {
+          statusDot.className = 'status-dot connected';
+          statusText.innerText = 'Connected';
+        } else {
+          statusDot.className = 'status-dot disconnected';
+          statusText.innerText = 'Disconnected';
+        }
+      }
+
+      function joinChannel() {
+        const channelInput = document.getElementById('channel-input');
+        const channelId = channelInput.value.trim();
+
+        if (!channelId) {
+          log('Please enter a valid channel ID', 'error');
+          return;
+        }
+
+        // Leave previous channel if any
+        if (currentChannel) {
+          socket.emit('leaveChannel', currentChannel);
+          log(`Left channel: ${currentChannel}`, 'info');
+        }
+
+        // Join new channel
+        socket.emit('joinChannel', channelId);
+        currentChannel = channelId;
+
+        document.getElementById(
+          'channel-status'
+        ).innerText = `Current channel: ${channelId}`;
+        log(`Joined channel: ${channelId}`, 'info');
+      }
+
+      function updateUserList(users) {
+        const userCount = document.getElementById('user-count');
+        const userList = document.getElementById('user-list');
+
+        userCount.innerText = users.length;
+
+        userList.innerHTML = '';
+        users.forEach((userId) => {
+          const userElement = document.createElement('div');
+          userElement.innerText =
+            userId === socket.id ? `${userId} (you)` : userId;
+          userElement.className =
+            userId === socket.id ? 'user-item self' : 'user-item';
+          userList.appendChild(userElement);
+        });
+      }
+
+      function sendPTTStatus(status) {
+        if (!currentChannel) {
+          log('Join a channel first', 'warn');
+          return;
+        }
+
+        socket.emit('pttStatus', {
+          channelId: currentChannel,
+          status: status,
+        });
+
+        document.getElementById(
+          'ptt-status'
+        ).innerText = `Current PTT status: ${status ? 'ON' : 'OFF'}`;
+        log(`Sent PTT status: ${status}`, 'debug');
+
+        // Update our own speaking status
+        updateSpeakingUser(socket.id, status);
+      }
+
+      function updateSpeakingUser(userId, status) {
+        const speakingUser = document.getElementById('speaking-user');
+
+        if (status) {
+          const isMe = userId === socket.id;
+          speakingUser.innerText = isMe
+            ? 'You are talking'
+            : `User ${userId} is talking`;
+          speakingUser.innerHTML += ' <span class="badge danger">LIVE</span>';
+        } else {
+          // Only clear if this user was the one talking
+          if (speakingUser.innerText.includes(userId)) {
+            speakingUser.innerText = 'No one is talking';
+          }
+        }
+      }
+
+      async function setupMediaRecorder() {
+        try {
+          log('Requesting audio permission...', 'info');
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+          });
+          log('Audio permission granted', 'info');
+
+          // Set up audio context and analyser for visualization
+          if (!audioContext) {
+            audioContext = new (window.AudioContext ||
+              window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 256;
+          }
+
+          // Connect the stream to the analyser
+          source = audioContext.createMediaStreamSource(stream);
+          source.connect(analyser);
+
+          // Create media recorder with appropriate options
+          // Using audio/webm for broad compatibility
+          let options = { mimeType: 'audio/webm' };
+
+          // Fallback options in case primary ones aren't supported
+          try {
+            mediaRecorder = new MediaRecorder(stream, options);
+          } catch (e) {
+            log('WebM format not supported, trying MP4', 'warn');
+            options = { mimeType: 'audio/mp4' };
+            try {
+              mediaRecorder = new MediaRecorder(stream, options);
+            } catch (e2) {
+              log('MP4 format not supported, using default format', 'warn');
+              mediaRecorder = new MediaRecorder(stream);
+            }
+          }
+
+          log(`Using audio format: ${mediaRecorder.mimeType}`, 'debug');
+
+          // Set up media recorder event handlers
+          mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+              audioChunks.push(event.data);
+            }
+          };
+
+          mediaRecorder.onstop = processRecording;
+
+          return true;
+        } catch (err) {
+          log(`Error setting up media recorder: ${err.message}`, 'error');
+          return false;
+        }
+      }
+
+      async function startRecording(e) {
+        e.preventDefault();
+
+        if (!currentChannel) {
+          log('Join a channel first', 'warn');
+          return;
+        }
+
+        if (!mediaRecorder) {
+          const setup = await setupMediaRecorder();
+          if (!setup) return;
+        }
+
+        try {
+          // Reset chunks
+          audioChunks = [];
+
+          // Start recording
+          mediaRecorder.start();
+          recordingStartTime = Date.now();
+
+          // Update UI
+          document.getElementById('record-button').classList.add('recording');
+          document.getElementById('record-button').innerText =
+            'RELEASE TO SEND';
+          document.getElementById('recording-status').innerText =
+            'Recording...';
+
+          // Start visualizer
+          startVisualizer();
+
+          // Send PTT ON status
+          sendPTTStatus(true);
+
+          log('Recording started', 'info');
+        } catch (err) {
+          log(`Error starting recording: ${err.message}`, 'error');
+        }
+      }
+
+      function stopRecording(e) {
+        if (e) e.preventDefault();
+
+        if (!mediaRecorder || mediaRecorder.state !== 'recording') {
+          return;
+        }
+
+        try {
+          // Stop recording
+          mediaRecorder.stop();
+
+          // Update UI
+          document
+            .getElementById('record-button')
+            .classList.remove('recording');
+          document.getElementById('record-button').innerText = 'HOLD TO TALK';
+          document.getElementById('recording-status').innerText =
+            'Processing recording...';
+
+          // Stop visualizer
+          stopVisualizer();
+
+          // Send PTT OFF status
+          sendPTTStatus(false);
+
+          const duration = ((Date.now() - recordingStartTime) / 1000).toFixed(
+            2
+          );
+          log(`Recording stopped (${duration}s)`, 'info');
+        } catch (err) {
+          log(`Error stopping recording: ${err.message}`, 'error');
+        }
+      }
+
+      async function processRecording() {
+        try {
+          log('Processing recording...', 'debug');
+
+          if (!audioChunks.length) {
+            log('No audio data recorded', 'warn');
+            document.getElementById('recording-status').innerText =
+              'No audio data recorded';
+            return;
+          }
+
+          // Create a blob from the audio chunks
+          currentAudioBlob = new Blob(audioChunks, {
+            type: mediaRecorder.mimeType,
+          });
+          const size = (currentAudioBlob.size / 1024).toFixed(2);
+          log(`Audio blob created, size: ${size} KB`, 'debug');
+
+          // Create a URL for the blob
+          if (localAudioUrl) {
+            URL.revokeObjectURL(localAudioUrl);
+          }
+          localAudioUrl = URL.createObjectURL(currentAudioBlob);
+
+          // Display the recording in the local audio section
+          displayLocalAudio(localAudioUrl, size);
+
+          // Upload the file to the server
+          await uploadAudio(currentAudioBlob);
+        } catch (err) {
+          log(`Error processing recording: ${err.message}`, 'error');
+          document.getElementById('recording-status').innerText =
+            'Error processing recording';
+        }
+      }
+
+      async function uploadAudio(blob) {
+        if (!currentChannel) {
+          log('No active channel to send audio to', 'warn');
+          return;
+        }
+
+        log('Preparing to upload audio...', 'debug');
+
+        try {
+          // Create form data for upload
+          const formData = new FormData();
+          formData.append(
+            'audio',
+            blob,
+            'recording.' + (blob.type.includes('webm') ? 'webm' : 'mp4')
+          );
+
+          document.getElementById('recording-status').innerText =
+            'Uploading audio...';
+
+          // Create and configure XHR for progress tracking
+          const xhr = new XMLHttpRequest();
+
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+              const percent = (event.loaded / event.total) * 100;
+              document.getElementById('uploadProgressBar').style.width =
+                percent + '%';
+              log(`Upload progress: ${percent.toFixed(0)}%`, 'debug');
+            }
+          };
+
+          xhr.onload = function () {
+            if (xhr.status === 200) {
+              const result = JSON.parse(xhr.responseText);
+              log(`Upload successful: ${result.fileUrl}`, 'info');
+              document.getElementById('recording-status').innerText =
+                'Upload complete';
+              document.getElementById('uploadProgressBar').style.width = '100%';
+
+              // Send the audio data to the channel
+              socket.emit('audioData', {
+                channelId: currentChannel,
+                data: { uri: result.fileUrl },
+              });
+
+              log('Audio data sent to channel', 'info');
+
+              // Reset progress bar after a delay
+              setTimeout(() => {
+                document.getElementById('uploadProgressBar').style.width = '0%';
+                document.getElementById('recording-status').innerText =
+                  'Ready to record';
+              }, 2000);
+            } else {
+              log(`Upload failed with status ${xhr.status}`, 'error');
+              document.getElementById('recording-status').innerText =
+                'Upload failed';
+              fallbackSendLocalAudio();
+            }
+          };
+
+          xhr.onerror = function () {
+            log('Upload failed', 'error');
+            document.getElementById('recording-status').innerText =
+              'Upload failed';
+            fallbackSendLocalAudio();
+          };
+
+          // Open and send the request
+          xhr.open('POST', '/upload', true);
+          xhr.send(formData);
+        } catch (err) {
+          log(`Error uploading audio: ${err.message}`, 'error');
+          document.getElementById('recording-status').innerText =
+            'Error uploading';
+          fallbackSendLocalAudio();
+        }
+      }
+
+      function fallbackSendLocalAudio() {
+        log('Attempting to send local audio URL as fallback', 'warn');
+
+        // Send the local audio URL directly
+        if (localAudioUrl) {
+          socket.emit('audioData', {
+            channelId: currentChannel,
+            data: { uri: localAudioUrl },
+          });
+          log('Sent local audio URL to channel', 'info');
+        }
+      }
+
+      function displayLocalAudio(url, size) {
+        const container = document.getElementById('local-audio-container');
+        const timestamp = new Date().toLocaleTimeString();
+
+        // Clear container if it contains placeholder text
+        if (container.innerText === 'No local recordings yet') {
+          container.innerHTML = '';
+        }
+
+        // Create audio item
+        const audioItem = document.createElement('div');
+        audioItem.className = 'audio-item';
+
+        // Add timestamp and metadata
+        audioItem.innerHTML = `
+                <div>
+                    <div>Local Recording</div>
+                    <div class="audio-metadata">Size: ${size} KB • Recorded at ${timestamp}</div>
+                </div>
+                <div class="audio-controls">
+                    <audio src="${url}" controls></audio>
+                </div>
+            `;
+
+        // Add to container at the top
+        container.insertBefore(audioItem, container.firstChild);
+      }
+
+      function displayReceivedAudio(userId, url) {
+        const container = document.getElementById('received-audio-container');
+        const timestamp = new Date().toLocaleTimeString();
+
+        // Clear container if it contains placeholder text
+        if (container.innerText === 'No audio received yet') {
+          container.innerHTML = '';
+        }
+
+        // Create audio item
+        const audioItem = document.createElement('div');
+        audioItem.className = 'audio-item';
+
+        // Add user ID, timestamp, and audio player
+        audioItem.innerHTML = `
+                <div>
+                    <div>From: ${userId}${
+          userId === socket.id ? ' (you)' : ''
+        }</div>
+                    <div class="audio-metadata">Received at ${timestamp}</div>
+                </div>
+                <div class="audio-controls">
+                    <audio src="${url}" controls></audio>
+                </div>
+            `;
+
+        // Add to container at the top
+        container.insertBefore(audioItem, container.firstChild);
+      }
+
+      function startVisualizer() {
+        if (!analyser) return;
+
+        const visualizer = document.getElementById('recordingVisualizer');
+        visualizer.innerHTML = '';
+
+        // Create bars for the visualizer
+        const bufferLength = analyser.frequencyBinCount;
+        const barWidth = (visualizer.clientWidth / bufferLength) * 2.5;
+
+        const dataArray = new Uint8Array(bufferLength);
+
+        for (let i = 0; i < bufferLength; i++) {
+          const bar = document.createElement('div');
+          bar.className = 'visualizer-bar';
+          bar.style.left = i * barWidth + 'px';
+          bar.style.width = barWidth - 1 + 'px';
+          visualizer.appendChild(bar);
+        }
+
+        // Start the visualization
+        visualizerInterval = setInterval(() => {
+          analyser.getByteFrequencyData(dataArray);
+
+          const bars = document.querySelectorAll('.visualizer-bar');
+          for (let i = 0; i < bars.length; i++) {
+            const height = dataArray[i] / 2;
+            bars[i].style.height = height + 'px';
+          }
+        }, 50);
+      }
+
+      function stopVisualizer() {
+        if (visualizerInterval) {
+          clearInterval(visualizerInterval);
+          visualizerInterval = null;
+        }
+      }
+
+      function log(message, level = 'info') {
+        const logContainer = document.getElementById('log-container');
+        const timestamp = new Date().toLocaleTimeString();
+
+        const logEntry = document.createElement('div');
+        logEntry.className = `log-entry ${level}`;
+        logEntry.innerHTML = `<span class="timestamp">${timestamp}</span>${message}`;
+
+        logContainer.appendChild(logEntry);
+        logContainer.scrollTop = logContainer.scrollHeight;
+
+        // Also log to console
+        console[level](message);
+      }
+
+      function clearLog() {
+        document.getElementById('log-container').innerHTML = '';
+        log('Log cleared', 'debug');
+      }
+    </script>
+  </body>
+</html>
