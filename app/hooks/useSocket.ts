@@ -1,15 +1,16 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import socketService from '../services/socketService';
+import audioService from '../services/AudioService';
 import { SocketEventHandlers } from '../types';
 
 /**
- * Custom hook for managing socket connections and channels
+ * Custom hook for socket connection and channel management
  */
 export const useSocket = (
   frequency: number,
   initialHandlers: Partial<SocketEventHandlers> = {}
 ) => {
-  // Connection states
+  // Connection state
   const [isConnected, setIsConnected] = useState(false);
   const [isJoined, setIsJoined] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
@@ -18,256 +19,288 @@ export const useSocket = (
   const [activeUsers, setActiveUsers] = useState<string[]>([]);
   const [speakingUser, setSpeakingUser] = useState<string | null>(null);
 
-  // Refs
-  const mySocketId = useRef<string | null>(null);
-  const joinTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // References
+  const isMounted = useRef(false);
+  const channelId = `freq-${frequency.toFixed(2)}`;
+  const joinTimeoutIdRef = useRef<NodeJS.Timeout | null>(null);
 
-  /**
-   * Join a frequency channel
-   */
-  const joinFrequencyChannel = useCallback(
-    (freq: number) => {
-      const channelId = `freq-${freq.toFixed(2)}`;
-      console.log('[CHANNEL] Attempting to join channel:', channelId);
+  // Define joinChannel function with useRef to avoid dependency issues
+  const joinChannelRef = useRef<() => void>();
 
-      if (!socketService.isConnected()) {
-        console.error('[CHANNEL] Cannot join channel - socket not connected');
-        setConnectionError('Socket not connected. Try reconnecting.');
-        return;
-      }
+  // Join frequency channel implementation
+  joinChannelRef.current = () => {
+    console.log(`[CHANNEL] Attempting to join channel: ${channelId}`);
 
-      setIsJoined(false); // Reset joined state until we get confirmation
-      setConnectionError(null); // Clear any previous errors
+    if (!socketService.isConnected()) {
+      console.error('[CHANNEL] Cannot join channel - socket not connected');
+      setConnectionError('Socket not connected. Try reconnecting.');
+      return;
+    }
 
-      try {
-        // Clear any existing timeout
-        if (joinTimeoutRef.current) {
-          clearTimeout(joinTimeoutRef.current);
-        }
-
-        // Create a join timeout ID that we can clear if successful
-        joinTimeoutRef.current = setTimeout(() => {
-          if (!isJoined) {
-            console.warn(
-              '[CHANNEL] No join confirmation received within timeout'
-            );
-            setConnectionError('Join request timed out. Try again.');
-
-            // Try to re-send the join request as a recovery mechanism
-            try {
-              console.log('[CHANNEL] Re-sending join request after timeout');
-              socketService.joinChannel(channelId);
-            } catch (e) {
-              console.error('[CHANNEL] Failed to re-send join request:', e);
-            }
-          }
-        }, 5000); // 5 second timeout
-
-        // Join the channel
-        socketService.joinChannel(channelId);
-      } catch (error: any) {
-        console.error('[CHANNEL] Error joining channel:', error);
-        setConnectionError(`Join error: ${error.message}`);
-      }
-    },
-    [isJoined]
-  );
-
-  /**
-   * Reconnect to the server manually
-   */
-  const reconnectServer = useCallback(() => {
-    console.log('[CONNECTION] Manual reconnection requested');
-
-    // Reset states
-    setIsConnected(false);
-    setIsJoined(false);
     setConnectionError(null);
 
-    // Initialize a new socket connection
-    const socket = socketService.initialize();
+    // Set joining state to show the user something is happening
+    setIsJoined(false);
 
-    // Setup event handlers again
-    setupEventHandlers();
+    // Send the join request
+    socketService.joinChannel(channelId);
+
+    // Clear any existing timeout
+    if (joinTimeoutIdRef.current) {
+      clearTimeout(joinTimeoutIdRef.current);
+    }
+
+    // Create a join timeout that we'll clear if successful
+    joinTimeoutIdRef.current = setTimeout(() => {
+      if (isMounted.current && !isJoined) {
+        console.warn('[CHANNEL] No join confirmation received within timeout');
+        setConnectionError('Join request timed out. Try again.');
+
+        // Attempt to join again as a recovery mechanism
+        console.log('[CHANNEL] Retrying join after timeout');
+        socketService.joinChannel(channelId);
+      }
+    }, 7000); // Increase timeout to 7 seconds
+  };
+
+  // Create a stable joinChannel function for external consumption
+  const joinChannel = useCallback(() => {
+    joinChannelRef.current?.();
   }, []);
 
-  /**
-   * Set up socket event handlers
-   */
-  const setupEventHandlers = useCallback(() => {
-    // Core connection handlers
-    const handlers: Partial<SocketEventHandlers> = {
-      connect: () => {
-        console.log(
-          '[CONNECTION] Connected to server, socket ID:',
-          socketService.getSocketId()
-        );
-        mySocketId.current = socketService.getSocketId();
-        setIsConnected(true);
-        setConnectionError(null);
+  // Socket event handlers
+  const handleConnect = useCallback(() => {
+    if (!isMounted.current) return;
 
-        // Wait a moment before joining the channel
-        setTimeout(() => {
-          joinFrequencyChannel(frequency);
-        }, 1000);
-      },
+    console.log('[SOCKET] Connected to server');
+    setIsConnected(true);
+    setConnectionError(null);
 
-      disconnect: (reason) => {
-        console.log('[CONNECTION] Disconnected from server. Reason:', reason);
-        setIsConnected(false);
+    // Wait a moment before trying to join channel
+    setTimeout(() => {
+      if (isMounted.current) {
+        joinChannelRef.current?.();
+      }
+    }, 1000);
+  }, []);
 
-        // Don't reset joined state immediately if it's just a temporary issue
-        if (reason !== 'io client disconnect' && reason !== 'transport close') {
-          // User initiated disconnects or transport close shouldn't affect the joined state immediately
-          setTimeout(() => {
-            if (!socketService.isConnected()) {
-              setIsJoined(false);
-              setActiveUsers([]);
-            }
-          }, 3000);
-        } else {
-          // For explicit disconnects, reset joined state immediately
+  const handleDisconnect = useCallback((reason: string) => {
+    if (!isMounted.current) return;
+
+    console.log('[SOCKET] Disconnected:', reason);
+    setIsConnected(false);
+
+    // Don't reset joined state immediately for temporary disconnects
+    if (reason !== 'io client disconnect' && reason !== 'transport close') {
+      setTimeout(() => {
+        if (isMounted.current && !socketService.isConnected()) {
           setIsJoined(false);
           setActiveUsers([]);
         }
-      },
-
-      connect_error: (error) => {
-        console.error('[CONNECTION] Connection error:', error.message);
-        setConnectionError(`Connection error: ${error.message}`);
-        setIsConnected(false);
-      },
-
-      pong: () => {
-        console.log('[CONNECTION] Received pong from server');
-        // Connection is still good
-        setIsConnected(true);
-      },
-
-      reconnect_attempt: (attempt) => {
-        console.log(`[CONNECTION] Reconnection attempt #${attempt}`);
-      },
-
-      reconnect: (attempt) => {
-        console.log(`[CONNECTION] Reconnected after ${attempt} attempts`);
-        setConnectionError(null);
-        setIsConnected(true);
-      },
-
-      // Channel and user handlers
-      joinConfirmation: (data) => {
-        console.log(
-          `[CHANNEL] Received join confirmation for ${data.channelId}, success: ${data.success}`
-        );
-
-        // Clear any join timeout
-        if (joinTimeoutRef.current) {
-          clearTimeout(joinTimeoutRef.current);
-          joinTimeoutRef.current = null;
-        }
-
-        if (data.success) {
-          setIsJoined(true);
-          setConnectionError(null);
-        } else {
-          setIsJoined(false);
-          setConnectionError(
-            `Failed to join channel: ${data.error || 'Unknown error'}`
-          );
-        }
-      },
-
-      userJoined: (userId) => {
-        console.log('[USERS] User joined:', userId);
-        setActiveUsers((prev) => {
-          if (!prev.includes(userId)) {
-            return [...prev, userId];
-          }
-          return prev;
-        });
-      },
-
-      userLeft: (userId) => {
-        console.log('[USERS] User left:', userId);
-        setActiveUsers((prev) => prev.filter((id) => id !== userId));
-
-        // If the speaking user left, clear speaking status
-        if (speakingUser === userId) {
-          setSpeakingUser(null);
-        }
-      },
-
-      activeUsers: (users) => {
-        console.log('[USERS] Received active users list:', users);
-        setActiveUsers(users);
-        setIsJoined(true);
-      },
-
-      // Merge in any user-provided handlers for audio and PTT events
-      ...initialHandlers,
-    };
-
-    socketService.setupEventListeners(handlers);
-  }, [frequency, initialHandlers, joinFrequencyChannel, speakingUser]);
-
-  // Setup ping interval for keeping connection alive
-  useEffect(() => {
-    const pingInterval = setInterval(() => {
-      if (socketService.isConnected()) {
-        console.log('[CONNECTION] Sending ping to server');
-        socketService.sendPing();
-      }
-    }, 8000);
-
-    return () => clearInterval(pingInterval);
+      }, 3000);
+    } else {
+      setIsJoined(false);
+      setActiveUsers([]);
+    }
   }, []);
 
-  // Initialize socket connection on mount or frequency change
-  useEffect(() => {
-    console.log('[CONNECTION] Setting up socket connection');
-    setConnectionError(null);
+  const handleConnectError = useCallback((error: Error) => {
+    if (!isMounted.current) return;
 
-    // Reset state when frequency changes
+    console.error('[SOCKET] Connection error:', error.message);
+    setConnectionError(`Connection error: ${error.message}`);
+    setIsConnected(false);
+  }, []);
+
+  const handleUserJoined = useCallback((userId: string) => {
+    if (!isMounted.current) return;
+
+    console.log('[USERS] User joined:', userId);
+    setActiveUsers((prev) => {
+      if (!prev.includes(userId)) {
+        return [...prev, userId];
+      }
+      return prev;
+    });
+  }, []);
+
+  const handleUserLeft = useCallback((userId: string) => {
+    if (!isMounted.current) return;
+
+    console.log('[USERS] User left:', userId);
+    setActiveUsers((prev) => prev.filter((id) => id !== userId));
+
+    // If the speaking user left, clear speaking status
+    setSpeakingUser((prev) => (prev === userId ? null : prev));
+  }, []);
+
+  const handleActiveUsers = useCallback((users: string[]) => {
+    if (!isMounted.current) return;
+
+    console.log('[USERS] Received active users list:', users);
+    setActiveUsers(users);
+    setIsJoined(true);
+  }, []);
+
+  const handleJoinConfirmation = useCallback(
+    (data: { channelId: string; success: boolean; error?: string }) => {
+      if (!isMounted.current) return;
+
+      console.log(
+        `[CHANNEL] Received join confirmation for ${data.channelId}, success: ${data.success}`
+      );
+
+      if (data.success) {
+        setIsJoined(true);
+        setConnectionError(null);
+      } else {
+        setIsJoined(false);
+        setConnectionError(
+          `Failed to join channel: ${data.error || 'Unknown error'}`
+        );
+      }
+    },
+    []
+  );
+
+  // Explicitly handle the join confirmation event
+  useEffect(() => {
+    const onJoinConfirmation = (data: {
+      channelId: string;
+      success: boolean;
+      error?: string;
+    }) => {
+      if (!isMounted.current) return;
+
+      console.log(
+        `[CHANNEL] Received join confirmation for ${data.channelId}, success: ${data.success}`
+      );
+
+      // Clear join timeout
+      if (joinTimeoutIdRef.current) {
+        clearTimeout(joinTimeoutIdRef.current);
+        joinTimeoutIdRef.current = null;
+      }
+
+      if (data.channelId !== channelId) {
+        console.log(
+          `[CHANNEL] Ignoring join confirmation for different channel ${data.channelId}`
+        );
+        return;
+      }
+
+      if (data.success) {
+        setIsJoined(true);
+        setConnectionError(null);
+      } else {
+        setIsJoined(false);
+        setConnectionError(
+          `Failed to join channel: ${data.error || 'Unknown error'}`
+        );
+      }
+    };
+
+    socketService.on('joinConfirmation', onJoinConfirmation);
+
+    return () => {
+      socketService.off('joinConfirmation', onJoinConfirmation);
+    };
+  }, [channelId]);
+
+  // Setup socket connection and event listeners
+  useEffect(() => {
+    console.log(
+      '[SOCKET] Setting up socket connection for frequency:',
+      frequency
+    );
+    isMounted.current = true;
+
+    // Clear state when frequency changes
     setActiveUsers([]);
     setSpeakingUser(null);
-    setIsJoined(false);
 
+    // Initialize the connection with better error handling
     try {
-      // Initialize the socket connection
-      socketService.initialize();
+      const socket = socketService.initialize();
 
-      // Setup event handlers
-      setupEventHandlers();
+      // Set the socket in audioService to avoid duplicate connections
+      audioService.setSocket(socket);
+
+      // Set up event handlers using the setupEventListeners method
+      socketService.setupEventListeners({
+        connect: handleConnect,
+        disconnect: handleDisconnect,
+        connect_error: handleConnectError,
+        userJoined: handleUserJoined,
+        userLeft: handleUserLeft,
+        activeUsers: handleActiveUsers,
+      });
+
+      // Set initial connection state
+      setIsConnected(socketService.isConnected());
+
+      // If already connected, try to join channel after a short delay
+      if (socketService.isConnected()) {
+        console.log(
+          '[SOCKET] Already connected, will join channel after delay'
+        );
+        setTimeout(() => {
+          if (isMounted.current) {
+            joinChannelRef.current?.();
+          }
+        }, 1000);
+      } else {
+        console.log('[SOCKET] Not connected yet, waiting for connect event');
+      }
+
+      // Set up a ping interval to keep the connection alive
+      const pingInterval = setInterval(() => {
+        if (socketService.isConnected()) {
+          socketService.sendPing();
+        }
+      }, 8000);
 
       // Cleanup on unmount or frequency change
       return () => {
-        // Leave current frequency channel
-        const channelId = `freq-${frequency.toFixed(2)}`;
-        console.log(
-          `[CONNECTION] Leaving channel ${channelId} and disconnecting`
-        );
+        console.log('[SOCKET] Cleaning up socket for frequency:', frequency);
+        isMounted.current = false;
+        clearInterval(pingInterval);
 
-        try {
-          if (socketService.isConnected()) {
-            socketService.leaveChannel(channelId);
-            socketService.disconnect();
-          }
-        } catch (err) {
-          console.error('Error during socket cleanup:', err);
+        // Clear any existing timeout
+        if (joinTimeoutIdRef.current) {
+          clearTimeout(joinTimeoutIdRef.current);
+          joinTimeoutIdRef.current = null;
         }
 
-        // Clear any active timeouts
-        if (joinTimeoutRef.current) {
-          clearTimeout(joinTimeoutRef.current);
-          joinTimeoutRef.current = null;
-        }
+        // Leave the channel but don't disconnect completely
+        socketService.leaveChannel(channelId);
       };
-    } catch (error: any) {
-      console.error('[CONNECTION] Error setting up socket:', error);
-      setConnectionError(`Error: ${error.message}`);
-      return () => {};
+    } catch (error) {
+      console.error('[SOCKET] Error setting up socket:', error);
+      setConnectionError(
+        `Error: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+      return () => {
+        isMounted.current = false;
+      };
     }
-  }, [frequency, setupEventHandlers]);
+  }, [
+    frequency,
+    handleConnect,
+    handleDisconnect,
+    handleConnectError,
+    handleUserJoined,
+    handleUserLeft,
+    handleActiveUsers,
+    channelId,
+  ]);
+
+  // Reconnect to the server
+  const reconnect = useCallback(() => {
+    console.log('[CONNECTION] Manual reconnection requested');
+    setConnectionError(null);
+    socketService.initialize();
+  }, []);
 
   return {
     isConnected,
@@ -275,10 +308,9 @@ export const useSocket = (
     connectionError,
     activeUsers,
     speakingUser,
-    mySocketId: mySocketId.current,
-    reconnectServer,
-    joinFrequencyChannel,
     setSpeakingUser,
+    reconnect,
+    joinChannel,
   };
 };
 

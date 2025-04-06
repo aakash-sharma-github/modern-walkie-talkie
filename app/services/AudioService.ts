@@ -45,7 +45,6 @@ class AudioService {
 
   constructor() {
     this.eventEmitter = new EventEmitter();
-    this.initializeSocket();
   }
 
   // Event handling methods
@@ -57,40 +56,8 @@ class AudioService {
     this.eventEmitter.off(event, callback as any);
   }
 
-  private initializeSocket() {
-    try {
-      this.socket = io(BACKEND_URL);
-
-      this.socket.on('connect', () => {
-        console.log('Connected to server');
-        this.eventEmitter.emit('connection:status', true);
-      });
-
-      this.socket.on('disconnect', () => {
-        this.eventEmitter.emit('connection:status', false);
-      });
-
-      this.socket.on('userJoined', (userId: string) => {
-        this.eventEmitter.emit('user:joined', userId);
-      });
-
-      this.socket.on('userLeft', (userId: string) => {
-        this.eventEmitter.emit('user:left', userId);
-      });
-
-      this.socket.on('audioData', async ({ userId, data }) => {
-        this.eventEmitter.emit('audio:playing', userId);
-        await this.playAudio(data);
-        this.eventEmitter.emit('audio:stopped', userId);
-      });
-
-      this.socket.on('pttStatus', ({ userId, status }) => {
-        this.eventEmitter.emit('ptt:status', { userId, status });
-      });
-    } catch (error) {
-      console.error('Socket initialization error:', error);
-      this.eventEmitter.emit('error', new Error('Failed to connect to server'));
-    }
+  setSocket(socket: Socket) {
+    this.socket = socket;
   }
 
   async joinChannel(channelId: string) {
@@ -191,27 +158,80 @@ class AudioService {
     }
   }
 
-  private async playAudio(audioData: any) {
+  /**
+   * Play audio from a URI
+   */
+  async playAudio(uri: string): Promise<Audio.Sound | null> {
     try {
+      // Force cleanup of previous sound
       if (this.sound) {
-        await this.sound.unloadAsync();
+        try {
+          await this.sound.unloadAsync();
+          console.log('Unloaded previous sound');
+        } catch (err) {
+          console.error('Error unloading previous sound:', err);
+        }
       }
 
-      const { sound } = await Audio.Sound.createAsync(
-        { uri: audioData.uri },
-        { shouldPlay: true }
-      );
-      this.sound = sound;
+      // Normalize URI to ensure it doesn't use localhost
+      uri = socketService.normalizeUrl(uri);
+      console.log('Playing normalized audio URI:', uri);
 
-      await this.sound.playAsync();
-      this.sound.setOnPlaybackStatusUpdate(async (status) => {
-        if ('isLoaded' in status && status.isLoaded && status.didJustFinish) {
-          await this.sound?.unloadAsync();
+      try {
+        // Create and play sound
+        const { sound: newSound } = await Audio.Sound.createAsync(
+          { uri },
+          { shouldPlay: true },
+          (status) => {
+            // This is a status update callback
+            if ('isLoaded' in status && status.isLoaded) {
+              if (status.didJustFinish) {
+                console.log('Audio playback finished');
+                this.sound
+                  ?.unloadAsync()
+                  .catch((err) =>
+                    console.error('Error unloading sound after playback:', err)
+                  );
+                this.sound = null;
+              }
+            }
+          }
+        );
+
+        this.sound = newSound;
+        return newSound;
+      } catch (playError) {
+        console.error('Error creating or playing sound:', playError);
+
+        // Attempt to play again with a different approach for Android
+        try {
+          console.log('Trying alternative playback method...');
+          const soundObject = new Audio.Sound();
+          await soundObject.loadAsync({ uri });
+          await soundObject.playAsync();
+
+          soundObject.setOnPlaybackStatusUpdate((status) => {
+            if ('isLoaded' in status && status.isLoaded && !status.isPlaying) {
+              console.log('Alternative audio playback finished');
+              soundObject
+                .unloadAsync()
+                .catch((err) =>
+                  console.error('Error unloading alternative sound:', err)
+                );
+            }
+          });
+
+          this.sound = soundObject;
+          return soundObject;
+        } catch (altError) {
+          console.error('Alternative playback failed:', altError);
+          Alert.alert('Audio Error', 'Failed to play received audio');
+          return null;
         }
-      });
+      }
     } catch (error) {
-      console.error('Playback error:', error);
-      this.eventEmitter.emit('error', new Error('Failed to play audio'));
+      console.error('Error handling received audio:', error);
+      return null;
     }
   }
 
@@ -229,7 +249,10 @@ class AudioService {
     try {
       const { granted } = await Audio.requestPermissionsAsync();
       if (!granted) {
-        Alert.alert('Permission Required', 'Audio recording permission is needed');
+        Alert.alert(
+          'Permission Required',
+          'Audio recording permission is needed'
+        );
         return false;
       }
 
@@ -252,13 +275,13 @@ class AudioService {
   async startRecording(): Promise<ExtendedRecording | null> {
     try {
       console.log('Starting recording...');
-      
+
       // Track recording start time to enforce minimum duration
       const recordingStartTime = Date.now();
-      
+
       // Clean up any existing recording
       if (this.recording) {
-        await this.recording.stopAndUnloadAsync().catch(err => {
+        await this.recording.stopAndUnloadAsync().catch((err) => {
           console.error('Error stopping previous recording:', err);
         });
         this.recording = null;
@@ -270,7 +293,7 @@ class AudioService {
 
       // Prepare recording
       console.log('Setting up recording...');
-      
+
       // Use HIGH_QUALITY preset but with compressed format
       const recordingOptions = {
         ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
@@ -287,14 +310,14 @@ class AudioService {
           audioQuality: Audio.IOSAudioQuality.MEDIUM,
         },
       };
-      
+
       // Create and start recording
       const { recording } = await Audio.Recording.createAsync(recordingOptions);
-      
+
       // Store recording object and start time in ref for later use
       this.recording = recording as ExtendedRecording;
       this.recording._startTime = recordingStartTime;
-      
+
       console.log('Recording started successfully');
       return this.recording;
     } catch (err) {
@@ -310,35 +333,37 @@ class AudioService {
   async stopRecording(channelId: string): Promise<string | null> {
     try {
       console.log('Stopping recording...');
-      
+
       // Check if we have an active recording object
       if (!this.recording) {
         console.log('No active recording reference to stop');
         return null;
       }
-      
+
       // Get reference to the recording before clearing it
       const recording = this.recording;
       const recordingStartTime = this.recording._startTime || 0;
-      
+
       // Check if the recording duration is less than our minimum threshold
       const currentTime = Date.now();
       const recordingDuration = currentTime - recordingStartTime;
-      
+
       if (recordingDuration < MIN_RECORDING_DURATION) {
-        console.log(`Recording too short (${recordingDuration}ms), waiting before stopping...`);
-        
+        console.log(
+          `Recording too short (${recordingDuration}ms), waiting before stopping...`
+        );
+
         // Wait until we reach minimum duration
         const timeToWait = MIN_RECORDING_DURATION - recordingDuration;
-        
+
         // Wait the minimum time before trying to stop recording
-        await new Promise(resolve => setTimeout(resolve, timeToWait));
+        await new Promise((resolve) => setTimeout(resolve, timeToWait));
         console.log(`Waited ${timeToWait}ms, now stopping recording...`);
       }
-      
+
       // Clear reference immediately to prevent double-stop attempts
       this.recording = null;
-      
+
       try {
         // Check if the recording exists and has proper methods
         if (recording && typeof recording.stopAndUnloadAsync === 'function') {
@@ -347,47 +372,54 @@ class AudioService {
             console.log('Recording stopped successfully');
           } catch (stopError: any) {
             console.error('Error stopping recording:', stopError);
-            
+
             // Handle "no valid audio data" error
-            if (stopError.message && stopError.message.includes('no valid audio data')) {
-              console.log('No valid audio data received, skipping audio upload');
+            if (
+              stopError.message &&
+              stopError.message.includes('no valid audio data')
+            ) {
+              console.log(
+                'No valid audio data received, skipping audio upload'
+              );
               return null;
             }
-            
+
             // Re-throw other errors
             throw stopError;
           }
-          
+
           // Get the recorded audio URI
           const uri = recording.getURI();
           console.log('Recording completed, URI:', uri);
-          
+
           if (!uri) {
             console.error('No URI from recording');
             return null;
           }
-          
+
           // Store the last recording URI for replay
           this.lastRecording = uri;
-          
+
           // Load the sound for local playback
           const { sound: newSound } = await Audio.Sound.createAsync({ uri });
           this.sound = newSound;
-          
+
           // Read the file into memory and upload it
           const fileInfo = await FileSystem.getInfoAsync(uri);
           console.log('File info:', fileInfo);
-          
+
           if (fileInfo.exists && fileInfo.size > 0) {
             // Upload the audio file
-            this.uploadAudioWithRetry(uri, channelId);
-            return uri;
+            const fullAudioUrl = await this.uploadAudio(uri, channelId);
+            return fullAudioUrl;
           } else {
             console.error('Audio file missing or empty');
             return null;
           }
         } else {
-          console.error('Invalid recording object or missing stopAndUnloadAsync method');
+          console.error(
+            'Invalid recording object or missing stopAndUnloadAsync method'
+          );
           return null;
         }
       } catch (stopError) {
@@ -407,7 +439,7 @@ class AudioService {
     if (!this.sound || !this.lastRecording) {
       return false;
     }
-    
+
     try {
       await this.sound.playAsync();
       this.sound.setOnPlaybackStatusUpdate((status) => {
@@ -423,95 +455,31 @@ class AudioService {
   }
 
   /**
-   * Play audio from a URI
-   */
-  async playAudio(uri: string): Promise<Audio.Sound | null> {
-    try {
-      // Force cleanup of previous sound
-      if (this.sound) {
-        try {
-          await this.sound.unloadAsync();
-          console.log('Unloaded previous sound');
-        } catch (err) {
-          console.error('Error unloading previous sound:', err);
-        }
-      }
-      
-      try {
-        // Create and play sound
-        const { sound: newSound } = await Audio.Sound.createAsync(
-          { uri },
-          { shouldPlay: true },
-          (status) => {
-            // This is a status update callback
-            if ('isLoaded' in status && status.isLoaded) {
-              if (status.didJustFinish) {
-                console.log('Audio playback finished');
-                this.sound?.unloadAsync().catch(err => 
-                  console.error('Error unloading sound after playback:', err)
-                );
-                this.sound = null;
-              }
-            }
-          }
-        );
-        
-        this.sound = newSound;
-        return newSound;
-        
-      } catch (playError) {
-        console.error('Error creating or playing sound:', playError);
-        
-        // Attempt to play again with a different approach for Android
-        try {
-          console.log('Trying alternative playback method...');
-          const soundObject = new Audio.Sound();
-          await soundObject.loadAsync({ uri });
-          await soundObject.playAsync();
-          
-          soundObject.setOnPlaybackStatusUpdate((status) => {
-            if ('isLoaded' in status && status.isLoaded && !status.isPlaying) {
-              console.log('Alternative audio playback finished');
-              soundObject.unloadAsync().catch(err => 
-                console.error('Error unloading alternative sound:', err)
-              );
-            }
-          });
-          
-          this.sound = soundObject;
-          return soundObject;
-        } catch (altError) {
-          console.error('Alternative playback failed:', altError);
-          Alert.alert('Audio Error', 'Failed to play received audio');
-          return null;
-        }
-      }
-    } catch (error) {
-      console.error('Error handling received audio:', error);
-      return null;
-    }
-  }
-
-  /**
    * Upload audio with retry capability and error handling
    */
-  async uploadAudioWithRetry(uri: string, channelId: string, maxRetries = 3): Promise<boolean> {
+  async uploadAudio(
+    uri: string,
+    channelId: string,
+    maxRetries = 3
+  ): Promise<string | null> {
     let retryCount = 0;
     let lastError = null;
 
     // Check if an upload was just performed
     const now = Date.now();
     const timeSinceLastUpload = now - this.lastUploadTime;
-    
+
     if (timeSinceLastUpload < MIN_UPLOAD_INTERVAL && this.lastUploadTime > 0) {
-      console.log(`Last upload was ${timeSinceLastUpload}ms ago, waiting before starting new upload...`);
-      
+      console.log(
+        `Last upload was ${timeSinceLastUpload}ms ago, waiting before starting new upload...`
+      );
+
       // Wait until the minimum interval has passed
       const timeToWait = MIN_UPLOAD_INTERVAL - timeSinceLastUpload;
-      await new Promise(resolve => setTimeout(resolve, timeToWait));
+      await new Promise((resolve) => setTimeout(resolve, timeToWait));
       console.log(`Waited ${timeToWait}ms, now starting upload`);
     }
-    
+
     // Update the last upload time
     this.lastUploadTime = Date.now();
 
@@ -527,7 +495,8 @@ class AudioService {
           name: `recording-${Date.now()}.m4a`
         } as any);
         
-        const uploadUrl = `${socketService.getSocketUrl()}/upload`;
+        // Ensure we're using a properly formatted upload URL
+        const uploadUrl = `${socketService.getServerBaseUrl()}/upload`;
         console.log('Upload URL:', uploadUrl);
         
         // Set timeout to 15 seconds
@@ -553,15 +522,10 @@ class AudioService {
         console.log('Upload result:', result);
         
         if (result.success) {
-          // Send the server URL to other clients
-          const fullAudioUrl = `${socketService.getSocketUrl()}${result.fileUrl}`;
-          console.log('Full audio URL:', fullAudioUrl);
-          
-          socketService.sendAudioData(channelId, { uri: fullAudioUrl });
-          console.log('Audio data sent to channel');
-          
-          // Return success
-          return true;
+          // The server now returns the full URL directly, so use it
+          const fullAudioUrl = result.fileUrl;
+          console.log('Full audio URL from server:', fullAudioUrl);
+          return fullAudioUrl;
         } else {
           throw new Error(result.error || 'Upload failed');
         }
@@ -583,16 +547,7 @@ class AudioService {
     
     // If we get here, all retries failed
     console.error(`Upload failed after ${maxRetries} attempts:`, lastError);
-    
-    // Send PTT OFF status in case it wasn't sent
-    socketService.sendPttStatus({
-      channelId: channelId,
-      status: false,
-      message: 'Failed to upload audio'
-    });
-    
-    // Return failure
-    return false;
+    return null;
   }
 
   /**
@@ -601,14 +556,20 @@ class AudioService {
   async cleanup(): Promise<void> {
     try {
       if (this.recording) {
-        await this.recording.stopAndUnloadAsync()
-          .catch(err => console.error('Error stopping recording during cleanup:', err));
+        await this.recording
+          .stopAndUnloadAsync()
+          .catch((err) =>
+            console.error('Error stopping recording during cleanup:', err)
+          );
         this.recording = null;
       }
-      
+
       if (this.sound) {
-        await this.sound.unloadAsync()
-          .catch(err => console.error('Error unloading sound during cleanup:', err));
+        await this.sound
+          .unloadAsync()
+          .catch((err) =>
+            console.error('Error unloading sound during cleanup:', err)
+          );
         this.sound = null;
       }
     } catch (err) {

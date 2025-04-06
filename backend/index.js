@@ -5,6 +5,7 @@ const cors = require('cors');
 const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
+const os = require('os');
 
 // Create Express app, HTTP server, and Socket.io instance
 const app = express();
@@ -176,9 +177,16 @@ app.post('/upload', (req, res, next) => {
                 return res.status(400).json({ success: false, error: 'No file uploaded' });
             }
 
-            // Return the public URL for the uploaded file
-            const fileUrl = `/uploads/${req.file.filename}`;
+            // Get the relative path for the file
+            const filePath = `/uploads/${req.file.filename}`;
+
+            // Create full URL with protocol and hostname
+            const protocol = req.headers['x-forwarded-proto'] || 'http';
+            const host = req.headers.host || req.headers['x-forwarded-host'] || `localhost:${PORT}`;
+            const fileUrl = `${protocol}://${host}${filePath}`;
+
             console.log(`File uploaded for request ${requestId}: ${req.file.filename}, size: ${req.file.size} bytes`);
+            console.log(`Full URL: ${fileUrl}`);
 
             // Track the file for auto-deletion after 4 minutes
             uploadedFiles.set(req.file.filename, Date.now());
@@ -190,7 +198,8 @@ app.post('/upload', (req, res, next) => {
 
             return res.json({
                 success: true,
-                fileUrl: fileUrl,
+                fileUrl: fileUrl,        // Full URL with host and protocol
+                filePath: filePath,      // Just the path for legacy support
                 fileName: req.file.filename,
                 fileSize: req.file.size,
                 processingTime: processingTime,
@@ -203,263 +212,194 @@ app.post('/upload', (req, res, next) => {
     });
 });
 
-// Socket.io connection handler
+// Set up Socket.io connection handling
 io.on('connection', (socket) => {
-    console.log(`User connected: ${socket.id}`);
+    console.log(`[SOCKET] User connected: ${socket.id}`);
 
-    // Keep track of last activity time for this socket 
-    let lastActivity = Date.now();
+    // Track user's channels
+    const userChannels = new Set();
 
-    // Create function to update activity timestamp
-    const updateActivity = () => {
-        lastActivity = Date.now();
-    };
-
-    // Update activity timestamp on any message
-    socket.onAny(updateActivity);
-
-    // Add ping handling to keep connections alive
-    socket.on('ping', () => {
-        console.log(`Ping received from ${socket.id}`);
-        updateActivity();
-        // Respond with a pong
-        socket.emit('pong');
-    });
-
-    // Handle test message to debug connection
-    socket.on('test', (message) => {
-        console.log(`Test message from ${socket.id}:`, message);
-        // Echo back the message
-        socket.emit('testResponse', {
-            received: message,
-            serverTime: new Date().toISOString()
-        });
-    });
-
-    // Enhanced joinChannel event with better error handling
     socket.on('joinChannel', (channelId) => {
-        try {
-            console.log(`User ${socket.id} attempting to join channel ${channelId}`);
+        // Input validation
+        if (!channelId || typeof channelId !== 'string') {
+            console.error(`[ERROR] Invalid channel ID from ${socket.id}: ${channelId}`);
+            socket.emit('joinConfirmation', {
+                channelId: String(channelId) || 'unknown',
+                success: false,
+                error: 'Invalid channel ID'
+            });
+            return;
+        }
 
-            // Always send a confirmation, even if there's an error
-            const sendConfirmation = (success, errorMsg) => {
-                console.log(`Sending join confirmation to ${socket.id}: ${success ? 'success' : 'failed - ' + errorMsg}`);
-                socket.emit('joinConfirmation', {
-                    channelId: channelId,
-                    success: success,
-                    error: errorMsg || null
-                });
-            };
+        // Check if user is already in this channel
+        if (userChannels.has(channelId)) {
+            console.log(`[CHANNEL] User ${socket.id} already in channel ${channelId}, sending confirmation`);
 
-            // Validate input
-            if (!channelId || typeof channelId !== 'string') {
-                console.error(`Invalid channel ID from ${socket.id}: ${channelId}`);
-                return sendConfirmation(false, 'Invalid channel ID');
-            }
+            // Even if already joined, send these messages to ensure UI is updated correctly
+            const room = io.sockets.adapter.rooms.get(channelId);
+            const users = room ? Array.from(room) : [];
 
-            // Leave all other channels first
-            Object.keys(socket.rooms).forEach((room) => {
-                if (room !== socket.id) {
-                    socket.leave(room);
-
-                    // Notify other users in the channel that this user left
-                    io.to(room).emit('userLeft', socket.id);
-
-                    // Remove user from active users list for channel
-                    if (activeChannels[room]) {
-                        activeChannels[room] = activeChannels[room].filter(id => id !== socket.id);
-                        console.log(`User ${socket.id} left channel ${room}`);
-                    }
-                }
+            socket.emit('joinConfirmation', {
+                channelId,
+                success: true
             });
 
-            // Join the new channel
+            socket.emit('activeUsers', users);
+            return;
+        }
+
+        console.log(`[CHANNEL] User ${socket.id} joining channel: ${channelId}`);
+
+        try {
+            // Join the channel
             socket.join(channelId);
-            console.log(`User ${socket.id} joined channel ${channelId}`);
+            userChannels.add(channelId);
 
-            // Update active channels
-            if (!activeChannels[channelId]) {
-                activeChannels[channelId] = [];
-            }
+            // Get users in this channel
+            const room = io.sockets.adapter.rooms.get(channelId);
+            const users = room ? Array.from(room) : [];
 
-            // Add user to active users if not already present
-            if (!activeChannels[channelId].includes(socket.id)) {
-                activeChannels[channelId].push(socket.id);
-            }
+            console.log(`[CHANNEL] Users in ${channelId}:`, users);
 
-            // Notify everyone in the channel about the new user
-            io.to(channelId).emit('userJoined', socket.id);
-
-            // Send currently active users to the joining client
-            socket.emit('activeUsers', activeChannels[channelId]);
-
-            // Send join confirmation to the client
-            sendConfirmation(true);
-
-            // Debug: log all channels and their users
-            console.log('Active channels:', Object.keys(activeChannels).map(channel => {
-                return {
-                    channel: channel,
-                    users: activeChannels[channel].length
-                };
-            }));
-
-        } catch (error) {
-            console.error(`Error handling joinChannel for ${socket.id}:`, error);
-
-            // Send error back to client
+            // Send confirmation FIRST to ensure it's not delayed
             socket.emit('joinConfirmation', {
-                channelId: channelId,
+                channelId,
+                success: true
+            });
+
+            // Small delay to ensure joinConfirmation is processed first
+            setTimeout(() => {
+                // Then send active users list (this can be delayed slightly)
+                socket.emit('activeUsers', users);
+
+                // Notify other users in the channel
+                socket.to(channelId).emit('userJoined', socket.id);
+
+                // Log active channels
+                console.log(`[SERVER] Active channels:`, getActiveChannels());
+            }, 100);
+        } catch (error) {
+            console.error(`[ERROR] Failed to join channel ${channelId}:`, error);
+            socket.emit('joinConfirmation', {
+                channelId,
                 success: false,
                 error: error.message
             });
         }
     });
 
-    // Handle leaving a channel
     socket.on('leaveChannel', (channelId) => {
-        socket.leave(channelId);
-        console.log(`User ${socket.id} left channel ${channelId}`);
-
-        // Notify other users in the channel
-        io.to(channelId).emit('userLeft', socket.id);
-
-        // Update active channels
-        if (activeChannels[channelId]) {
-            activeChannels[channelId] = activeChannels[channelId].filter(id => id !== socket.id);
-        }
-    });
-
-    // Handle audio data sent from a client with improved reliability
-    socket.on('audioData', ({ channelId, data }) => {
-        console.log(`Received audio data from ${socket.id} for channel ${channelId}`);
-        updateActivity();
+        console.log(`[CHANNEL] User ${socket.id} leaving channel: ${channelId}`);
 
         try {
-            // Validate data
-            if (!data || !data.uri) {
-                console.error(`Invalid audio data from ${socket.id}`);
-                socket.emit('audioAck', { success: false, error: 'Invalid audio data' });
-                return;
-            }
+            socket.leave(channelId);
+            userChannels.delete(channelId);
 
-            console.log('Audio URI:', data.uri);
+            // Notify channel that user left
+            io.to(channelId).emit('userLeft', socket.id);
 
-            // First, send an explicit PTT OFF status to ensure UI is updated
-            io.to(channelId).emit('pttStatus', {
-                userId: socket.id,
-                status: false
-            });
-
-            // Add a small delay before sending audio to ensure PTT status is processed first
-            setTimeout(() => {
-                // Broadcast to everyone in the channel (including sender for debugging)
-                console.log(`Broadcasting audio to channel ${channelId}`);
-                io.to(channelId).emit('audioData', {
-                    userId: socket.id,
-                    data: data,
-                    timestamp: Date.now()
-                });
-
-                // Send acknowledgement to the sender
-                socket.emit('audioAck', {
-                    success: true,
-                    channelId,
-                    timestamp: Date.now()
-                });
-            }, 200);
+            console.log(`[SERVER] Active channels:`, getActiveChannels());
         } catch (error) {
-            console.error(`Error broadcasting audio data for ${socket.id}:`, error);
-            socket.emit('audioAck', { success: false, error: error.message });
+            console.error(`[ERROR] Failed to leave channel ${channelId}:`, error);
         }
     });
 
-    // Handle PTT (Push-to-Talk) status updates with improved reliability
-    socket.on('pttStatus', ({ channelId, status, message }) => {
-        console.log(`PTT status from ${socket.id} for channel ${channelId}: ${status}`);
-        if (message) console.log('Message:', message);
-        updateActivity();
-
-        try {
-            // For PTT OFF, we'll send twice to ensure it's received
-            if (status === false) {
-                // Send immediately
-                io.to(channelId).emit('pttStatus', {
-                    userId: socket.id,
-                    status: status,
-                    message: message
-                });
-
-                // Send again after a short delay to ensure reception
-                setTimeout(() => {
-                    io.to(channelId).emit('pttStatus', {
-                        userId: socket.id,
-                        status: status,
-                        message: message,
-                        timestamp: Date.now()
-                    });
-                }, 200);
-            } else {
-                // For PTT ON, just send once (no need for redundancy)
-                io.to(channelId).emit('pttStatus', {
-                    userId: socket.id,
-                    status: status,
-                    message: message
-                });
-            }
-
-            // For PTT OFF status, also send an explicit acknowledgement to the sender
-            if (status === false) {
-                socket.emit('pttAck', {
-                    channelId,
-                    status: false,
-                    received: true,
-                    timestamp: Date.now()
-                });
-            }
-        } catch (error) {
-            console.error(`Error broadcasting PTT status for ${socket.id}:`, error);
-            // Still try to send acknowledgement to the sender if possible
-            socket.emit('pttAck', {
-                channelId,
-                status: status,
-                received: false,
-                error: error.message
-            });
+    // Handle ptt status updates
+    socket.on('pttStatus', (data) => {
+        if (!data || !data.channelId) {
+            console.error('[ERROR] Invalid PTT status data:', data);
+            return;
         }
-    });
 
-    // Set up a health check interval to detect zombies
-    const healthCheckInterval = setInterval(() => {
-        const inactiveTime = Date.now() - lastActivity;
+        console.log(`[PTT] User ${socket.id} PTT status in ${data.channelId}: ${data.status}`);
 
-        // If no activity for over 60 seconds, consider the connection dead
-        if (inactiveTime > 60000) {
-            console.log(`Zombie connection detected for ${socket.id}, inactive for ${inactiveTime}ms`);
-            // Disconnect the socket to clean up resources
-            socket.disconnect(true);
+        // Make sure socket is in the channel
+        if (!userChannels.has(data.channelId)) {
+            console.log(`[WARNING] User ${socket.id} not in channel ${data.channelId}, ignoring PTT status`);
+            return;
         }
-    }, 30000); // Check every 30 seconds
 
-    // Clean up on disconnect
-    socket.on('disconnect', () => {
-        console.log(`User disconnected: ${socket.id}`);
-
-        // Clear the health check interval
-        clearInterval(healthCheckInterval);
-
-        // Remove user from all channels they were in
-        Object.keys(activeChannels).forEach(channelId => {
-            if (activeChannels[channelId].includes(socket.id)) {
-                // Remove from our tracking
-                activeChannels[channelId] = activeChannels[channelId].filter(id => id !== socket.id);
-
-                // Notify others
-                io.to(channelId).emit('userLeft', socket.id);
-            }
+        // Broadcast to all clients in the channel (including sender for consistency)
+        io.to(data.channelId).emit('pttStatus', {
+            userId: socket.id,
+            status: data.status
         });
     });
+
+    // Handle audio data
+    socket.on('audioData', (data) => {
+        if (!data || !data.channelId) {
+            console.error('[ERROR] Invalid audio data:', data);
+            return;
+        }
+
+        console.log(`[AUDIO] Received audio from ${socket.id} for channel ${data.channelId}`);
+
+        // Make sure socket is in the channel
+        if (!userChannels.has(data.channelId)) {
+            console.log(`[WARNING] User ${socket.id} not in channel ${data.channelId}, ignoring audio data`);
+            return;
+        }
+
+        // Ensure we're sending a full URL, not just a path
+        if (data.data && data.data.uri) {
+            // If the URI is just a path and not a full URL, convert it to a full URL
+            const uri = data.data.uri;
+            if (uri.startsWith('/uploads/')) {
+                // Get server hostname and port from the socket handshake
+                const protocol = socket.handshake.headers['x-forwarded-proto'] || 'http';
+                const host = socket.handshake.headers.host ||
+                    socket.handshake.headers['x-forwarded-host'] ||
+                    `localhost:${PORT}`;
+
+                // Create the full URL
+                data.data.uri = `${protocol}://${host}${uri}`;
+                console.log(`[AUDIO] Converted path to full URL: ${data.data.uri}`);
+            }
+        }
+
+        // Broadcast to other clients in the channel
+        socket.to(data.channelId).emit('audioData', {
+            userId: socket.id,
+            data: data.data
+        });
+    });
+
+    // Handle ping messages (keep-alive)
+    socket.on('ping', () => {
+        socket.emit('pong');
+    });
+
+    // Handle disconnection
+    socket.on('disconnect', (reason) => {
+        console.log(`[SOCKET] User disconnected: ${socket.id}, reason: ${reason}`);
+
+        // Notify all channels this user was part of
+        userChannels.forEach(channelId => {
+            io.to(channelId).emit('userLeft', socket.id);
+        });
+
+        // Clear user channels
+        userChannels.clear();
+
+        console.log(`[SERVER] Active channels:`, getActiveChannels());
+    });
 });
+
+// Helper function to get active channels
+function getActiveChannels() {
+    const channels = [];
+    for (const [channelId, sockets] of io.sockets.adapter.rooms.entries()) {
+        // Skip rooms that are actually socket IDs (socket.io creates a room for each socket)
+        if (!channelId.includes('freq-')) continue;
+
+        channels.push({
+            channel: channelId,
+            users: sockets.size
+        });
+    }
+    return channels;
+}
 
 // Log server IP addresses for easier connection
 const getIpAddresses = () => {
@@ -505,6 +445,9 @@ const startServer = (port) => {
 
             console.log('\nUse one of these IP addresses in your mobile app to connect to this server');
             console.log('=== Server Ready ===\n');
+
+            // Setup the audio cleanup routine
+            setupAudioCleanup();
         });
     } catch (error) {
         if (error.code === 'EADDRINUSE') {
@@ -527,4 +470,73 @@ const startServer = (port) => {
 // });
 
 // Start server with initial port
-startServer(PORT); 
+startServer(PORT);
+
+// Function to check if uploads folder has any files
+function hasAudioFiles() {
+    try {
+        const uploadPath = path.join(__dirname, 'public/uploads');
+        const files = fs.readdirSync(uploadPath);
+        return files.length > 0 && files.some(file => file.endsWith('.m4a'));
+    } catch (error) {
+        console.error('Error checking upload folder:', error);
+        return false;
+    }
+}
+
+// Function to clean up old audio files
+function setupAudioCleanup() {
+    // Only start the timer if there are files to clean up
+    if (hasAudioFiles()) {
+        console.log('[SERVER] Audio files found, starting cleanup timer (4 minutes)');
+        // Clean up audio files every 4 minutes
+        setInterval(() => {
+            cleanupOldAudioFiles();
+        }, 4 * 60 * 1000);
+    } else {
+        console.log('[SERVER] No audio files to clean up, skipping timer');
+    }
+}
+
+// Cleanup old audio files
+function cleanupOldAudioFiles() {
+    const uploadPath = path.join(__dirname, 'public/uploads');
+
+    try {
+        // Check if directory exists
+        if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
+            return;
+        }
+
+        console.log('[SERVER] Cleaning up old audio files...');
+        const files = fs.readdirSync(uploadPath);
+
+        // Current time in ms
+        const now = Date.now();
+        // Keep files that are less than 10 minutes old (600000 ms)
+        const maxAge = 10 * 60 * 1000;
+
+        let deletedCount = 0;
+
+        files.forEach(file => {
+            if (file.endsWith('.m4a')) {
+                const filePath = path.join(uploadPath, file);
+                const stats = fs.statSync(filePath);
+                const fileAge = now - stats.mtimeMs;
+
+                if (fileAge > maxAge) {
+                    // File is older than max age, delete it
+                    fs.unlinkSync(filePath);
+                    deletedCount++;
+                }
+            }
+        });
+
+        if (deletedCount > 0) {
+            console.log(`[SERVER] Deleted ${deletedCount} old audio files`);
+        }
+    } catch (error) {
+        console.error('[SERVER] Error cleaning up audio files:', error);
+    }
+} 

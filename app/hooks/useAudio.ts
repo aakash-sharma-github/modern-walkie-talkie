@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
 import { Audio } from 'expo-av';
-import audioService from '../services/audioService';
+import audioService from '../services/AudioService';
 import socketService from '../services/socketService';
 
 /**
@@ -84,6 +84,25 @@ export const useAudio = (
       if (uri) {
         // Store the last recording URI for replay
         setLastRecording(uri);
+
+        // Upload the audio to server
+        const uploadedUrl = await audioService.uploadAudio(
+          uri,
+          `freq-${frequency.toFixed(2)}`
+        );
+
+        if (uploadedUrl) {
+          console.log(
+            'Successfully uploaded audio, sending to channel:',
+            uploadedUrl
+          );
+          // Send the audio data to the channel
+          socketService.sendAudioData(`freq-${frequency.toFixed(2)}`, {
+            uri: uploadedUrl,
+          });
+        } else {
+          console.error('Failed to upload audio');
+        }
       }
 
       // Send PTT OFF status regardless of recording success
@@ -124,7 +143,7 @@ export const useAudio = (
         // Reset playing state when sound finishes
         const sound = audioService.getSound();
         if (sound) {
-          sound.setOnPlaybackStatusUpdate((status) => {
+          sound.setOnPlaybackStatusUpdate((status: any) => {
             if ('isLoaded' in status && status.isLoaded && !status.isPlaying) {
               setIsPlaying(false);
             }
@@ -151,14 +170,16 @@ export const useAudio = (
           return;
         }
 
-        console.log('Playing audio from URI:', data.uri);
+        // Normalize the audio URL to ensure it works on all devices
+        let audioUrl = socketService.normalizeUrl(data.uri);
+        console.log('Normalized audio URL:', audioUrl);
 
         // Clear any existing speaking user state to reset UI
         setSpeakingUser(null);
         setIsListening(true);
 
         // Play the audio
-        const sound = await audioService.playAudio(data.uri);
+        const sound = await audioService.playAudio(audioUrl);
 
         if (sound) {
           setIsPlaying(true);
